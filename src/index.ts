@@ -1,317 +1,240 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
-import { WebSocketServer, WebSocket, RawData } from 'ws';
-import { createClient, RedisClientType } from 'redis';
+import { Server } from 'socket.io';
+import Redis from 'ioredis';
 import cors from 'cors';
-import type { IncomingMessage } from 'http';
-
-type ClientMessage =
-    | {
-    type: 'identify';
-    userId: string;
-}
-    | {
-    type: 'subscribe' | 'unsubscribe';
-    channel: string;
-};
-
-type ServerMessage =
-    | { type: 'connected'; connectionId: string }
-    | { type: 'error'; message: string }
-    | { type: 'subscribed' | 'unsubscribed'; channel: string }
-    | {
-    type: 'message';
-    channel: string;
-    message: string;
-    timestamp: string;
-};
-
-interface Connection {
-    ws: WebSocket;
-    subscriptions: Set<string>;
-    userId: string | null;
-}
+import { z } from 'zod';
+import {getRedisClient} from "./redis";
 
 const app = express();
-const server = createServer(app);
+const httpServer = createServer(app);
 
-app.use(
-    cors({
-        origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-        credentials: true,
-    })
-);
-
-const wss = new WebSocketServer({
-    server,
-    path: '/',
+const io = new Server(httpServer, {
+    cors: {
+        origin: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+        methods: ["GET", "POST"],
+        credentials: true
+    }
 });
 
-const subscriber: RedisClientType = createClient({ url: process.env.REDIS_URL });
-const publisher: RedisClientType = createClient({ url: process.env.REDIS_URL });
-
-const connections = new Map<string, Connection>();
-const channelSubscriptions = new Map<string, Set<string>>();
-
-async function initializeRedis(): Promise<void> {
-    try {
-        await subscriber.connect();
-        await publisher.connect();
-        console.log('Connected to Redis');
-    }
-    catch (error) {
-        console.error('Failed to connect to Redis:', error);
-        process.exit(1);
-    }
+if (!process.env.REDIS_URL) {
+    throw new Error('Redis URL is missing');
 }
 
-wss.on('connection', async (ws: WebSocket, request: IncomingMessage) => {
-    try {
-        const url = new URL(request.url || '', `http://${request.headers.host}`);
-        const sessionToken = url.searchParams.get('token');
+const redisSubscriber = new Redis(process.env.REDIS_URL);
+const redisPublisher = new Redis(process.env.REDIS_URL);
 
-        if (!sessionToken) {
-            ws.close(4401, 'Unauthorized: No session token');
-            return;
+interface UserPresence {
+    userId: string;
+    name: string;
+    avatar?: string;
+    boardId: string;
+    lastSeen: Date;
+}
+
+const userPresence = new Map<string, UserPresence>();
+const boardUsers = new Map<string, Set<string>>();
+
+const JoinBoardSchema = z.object({
+    boardId: z.string(),
+});
+
+io.use(async (socket, next) => {
+    try {
+        let token = socket.handshake.auth.token || socket.handshake.query.token;
+
+        console.log(token);
+
+        if (!token) {
+            return next(new Error("Unauthorized: No session token"));
         }
 
-        const sessionRaw = await publisher.get(sessionToken);
+        const redis = await getRedisClient();
+        const sessionRaw = await redis.get(token);
+
         if (!sessionRaw) {
-            ws.close(4402, 'Unauthorized: Invalid session');
-            return;
+            return next(new Error("Unauthorized: Invalid session"));
         }
 
         const session = JSON.parse(sessionRaw);
         const userId = session?.user?.id;
         if (!userId) {
-            ws.close(4403, 'Unauthorized: Malformed session');
-            return;
+            return next(new Error("Unauthorized: Malformed session"));
         }
 
-        const connectionId = generateConnectionId();
+        socket.data.user = session.user;
 
-        console.log(`User authenticated: ${userId} (conn: ${connectionId})`);
-
-        connections.set(connectionId, {
-            ws,
-            subscriptions: new Set(),
-            userId,
-        });
-
-        ws.on('message', async (data: RawData) => {
-            try {
-                const message = JSON.parse(data.toString()) as ClientMessage;
-                await handleClientMessage(connectionId, message);
-            }
-            catch (error) {
-                console.error('Message parse error:', error);
-                ws.send(
-                    JSON.stringify({
-                        type: 'error',
-                        message: 'Invalid message format',
-                    } satisfies ServerMessage)
-                );
-            }
-        });
-
-        ws.on('close', () => {
-            console.log(`WebSocket disconnected: ${connectionId}`);
-            handleConnectionClose(connectionId);
-        });
-
-        ws.on('error', (error) => {
-            console.error(`WebSocket error for ${connectionId}:`, error);
-            handleConnectionClose(connectionId);
-        });
-
-        ws.send(
-            JSON.stringify({
-                type: 'connected',
-                connectionId,
-            } satisfies ServerMessage)
-        );
+        next();
     }
     catch (err) {
-        console.error('Authentication error:', err);
-        ws.close(4400, 'Unauthorized');
+        console.error("Auth error:", err);
+        next(new Error("Authentication failed"));
     }
 });
 
-async function handleClientMessage(connectionId: string, message: ClientMessage): Promise<void> {
-    const connection = connections.get(connectionId);
-    if (!connection) return;
+io.on('connection', (socket) => {
+    console.log(`Client connected: ${socket.id}`);
 
-    switch (message.type) {
-        case 'identify':
-            connection.userId = message.userId;
-            console.log(`Connection ${connectionId} identified as user ${message.userId}`);
-            break;
-
-        case 'subscribe':
-            if (!message.channel) {
-                connection.ws.send(
-                    JSON.stringify({
-                        type: 'error',
-                        message: 'Channel is required for subscription',
-                    } satisfies ServerMessage)
-                );
-                return;
-            }
-            await subscribeToChannel(connectionId, message.channel);
-            connection.ws.send(
-                JSON.stringify({
-                    type: 'subscribed',
-                    channel: message.channel,
-                } satisfies ServerMessage)
-            );
-            break;
-
-        case 'unsubscribe':
-            if (!message.channel) {
-                connection.ws.send(
-                    JSON.stringify({
-                        type: 'error',
-                        message: 'Channel is required for unsubscription',
-                    } satisfies ServerMessage)
-                );
-                return;
-            }
-            await unsubscribeFromChannel(connectionId, message.channel);
-            connection.ws.send(
-                JSON.stringify({
-                    type: 'unsubscribed',
-                    channel: message.channel,
-                } satisfies ServerMessage)
-            );
-            break;
-
-        default:
-            connection.ws.send(
-                JSON.stringify({
-                    type: 'error',
-                    message: `Unknown message type: ${(message as any).type}`,
-                } satisfies ServerMessage)
-            );
-    }
-}
-
-async function subscribeToChannel(connectionId: string, channel: string): Promise<void> {
-    const connection = connections.get(connectionId);
-    if (!connection) return;
-
-    connection.subscriptions.add(channel);
-
-    if (!channelSubscriptions.has(channel)) {
-        channelSubscriptions.set(channel, new Set());
-        await subscriber.subscribe(channel, (message) => {
-            handleRedisMessage(channel, message);
-        });
-        console.log(`Subscribed to Redis channel: ${channel}`);
-    }
-
-    channelSubscriptions.get(channel)!.add(connectionId);
-    console.log(`Connection ${connectionId} subscribed to ${channel}`);
-}
-
-async function unsubscribeFromChannel(connectionId: string, channel: string): Promise<void> {
-    const connection = connections.get(connectionId);
-    if (!connection) return;
-
-    connection.subscriptions.delete(channel);
-
-    const channelConnections = channelSubscriptions.get(channel);
-    if (channelConnections) {
-        channelConnections.delete(connectionId);
-
-        if (channelConnections.size === 0) {
-            channelSubscriptions.delete(channel);
-            await subscriber.unsubscribe(channel);
-            console.log(`Unsubscribed from Redis channel: ${channel}`);
+    socket.on('join-dashboard', () => {
+        try {
+            const userId = socket.data.user.id;
+            socket.join(`dashboard:${userId}`);
+            console.log(`User ${userId} joined dashboard`);
         }
-    }
-
-    console.log(`Connection ${connectionId} unsubscribed from ${channel}`);
-}
-
-function handleRedisMessage(channel: string, message: string): void {
-    console.log(`Redis message on ${channel}:`, message);
-
-    const channelConnections = channelSubscriptions.get(channel);
-    if (!channelConnections) return;
-
-    const payload: ServerMessage = {
-        type: 'message',
-        channel,
-        message,
-        timestamp: new Date().toISOString(),
-    };
-
-    channelConnections.forEach((connectionId) => {
-        const connection = connections.get(connectionId);
-        if (connection && connection.ws.readyState === WebSocket.OPEN) {
-            try {
-                connection.ws.send(JSON.stringify(payload));
-            }
-            catch (error) {
-                console.error(`Error sending message to ${connectionId}:`, error);
-                handleConnectionClose(connectionId);
-            }
-        }
-    });
-}
-
-function handleConnectionClose(connectionId: string): void {
-    const connection = connections.get(connectionId);
-    if (!connection) return;
-
-    connection.subscriptions.forEach((channel) => {
-        const channelConnections = channelSubscriptions.get(channel);
-        if (channelConnections) {
-            channelConnections.delete(connectionId);
-
-            if (channelConnections.size === 0) {
-                channelSubscriptions.delete(channel);
-                subscriber.unsubscribe(channel).catch(console.error);
-            }
+        catch (error) {
+            console.error('Error joining dashboard:', error);
         }
     });
 
-    connections.delete(connectionId);
-    console.log(`Cleaned up connection: ${connectionId}`);
-}
+    socket.on('join-board', (data: unknown) => {
+        try {
+            const { boardId } = JoinBoardSchema.parse(data);
 
-function generateConnectionId(): string {
-    return Math.random().toString(36).substring(2) + Date.now().toString(36);
-}
+            socket.join(`board:${boardId}`);
 
-async function shutdown(): Promise<void> {
-    console.log('Shutting down gracefully...');
+            const presence: UserPresence = {
+                userId: socket.data.user.id,
+                name: socket.data.user.name,
+                avatar: socket.data.user.image,
+                boardId,
+                lastSeen: new Date()
+            };
 
-    connections.forEach((connection) => {
-        connection.ws.close();
+            userPresence.set(socket.id, presence);
+
+            if (!boardUsers.has(boardId)) {
+                boardUsers.set(boardId, new Set());
+            }
+            boardUsers.get(boardId)!.add(socket.id);
+
+            broadcastPresence(boardId);
+
+            console.log(`User ${socket.data.user.name} joined board ${boardId}`);
+        }
+        catch (error) {
+            console.error('Error joining board:', error);
+            socket.emit('error', { message: 'Invalid join-board data' });
+        }
     });
 
-    await subscriber.quit();
-    await publisher.quit();
+    socket.on('leave-board', (data: { boardId: string }) => {
+        try {
+            const { boardId } = data;
+            socket.leave(`board:${boardId}`);
 
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
+            const presence = userPresence.get(socket.id);
+            if (presence && presence.boardId === boardId) {
+                userPresence.delete(socket.id);
+                boardUsers.get(boardId)?.delete(socket.id);
+
+                broadcastPresence(boardId);
+            }
+
+            console.log(`Socket ${socket.id} left board ${boardId}`);
+        }
+        catch (error) {
+            console.error('Error leaving board:', error);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`Client disconnected: ${socket.id}`);
+
+        const presence = userPresence.get(socket.id);
+        if (presence) {
+            userPresence.delete(socket.id);
+            boardUsers.get(presence.boardId)?.delete(socket.id);
+            broadcastPresence(presence.boardId);
+        }
+    });
+
+    socket.on('heartbeat', () => {
+        const presence = userPresence.get(socket.id);
+        if (presence) {
+            presence.lastSeen = new Date();
+            userPresence.set(socket.id, presence);
+        }
+    });
+});
+
+
+function broadcastPresence(boardId: string) {
+    const boardSocketIds = boardUsers.get(boardId);
+    if (!boardSocketIds) return;
+
+    const activeUsers = Array.from(boardSocketIds)
+        .map(socketId => userPresence.get(socketId))
+        .filter(Boolean)
+        .map(presence => ({
+            userId: presence!.userId,
+            name: presence!.name,
+            avatar: presence!.avatar,
+            lastSeen: presence!.lastSeen
+        }));
+
+    io.to(`board:${boardId}`).emit('presence-update', { users: activeUsers });
+}
+
+async function setupRedisSubscriptions() {
+    await redisSubscriber.psubscribe('board:update:*');
+    await redisSubscriber.psubscribe('users:update:*');
+    await redisSubscriber.psubscribe('boards:update:*');
+
+    redisSubscriber.on('pmessage', (pattern: string, channel: string, message: string) => {
+        console.log(`Redis message - Pattern: ${pattern}, Channel: ${channel}, Message: ${message}`);
+
+        try {
+            if (pattern === 'board:update:*') {
+                const boardId = channel.split(':')[2];
+
+                io.to(`board:${boardId}`).emit('invalidate-query', {
+                    queryKey: ['board', boardId],
+                    type: 'board-update'
+                });
+
+                console.log(`Sent board update to board:${boardId}`);
+            }
+
+            if (pattern === 'users:update:*') {
+                const boardId = channel.split(':')[2];
+
+                io.to(`board:${boardId}`).emit('invalidate-query', {
+                    queryKey: ['board-users', boardId],
+                    type: 'board-users-update'
+                });
+
+                console.log(`Sent board users update to board:${boardId}`);
+            }
+
+            if (pattern === 'boards:update:*') {
+                const userId = channel.split(':')[2];
+
+                io.to(`dashboard:${userId}`).emit('invalidate-query', {
+                    queryKey: ['all-boards'],
+                    type: 'all-boards-update'
+                });
+
+                console.log(`Sent all boards update to dashboard:${userId}`);
+            }
+        }
+        catch (error) {
+            console.error('Error processing Redis message:', error);
+        }
     });
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+app.use(cors());
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.WEBSOCKET_PORT || 3001;
 
-async function startServer(): Promise<void> {
+async function startServer() {
     try {
-        await initializeRedis();
+        await setupRedisSubscriptions();
+        console.log('Redis subscriptions set up successfully');
 
-        server.listen(PORT, () => {
-            console.log(`WebSocket server running on port ${PORT}`);
+        httpServer.listen(PORT, () => {
+            console.log(`Socket.IO server running on port ${PORT}`);
         });
     }
     catch (error) {
@@ -319,5 +242,23 @@ async function startServer(): Promise<void> {
         process.exit(1);
     }
 }
+
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    httpServer.close(() => {
+        redisSubscriber.disconnect();
+        redisPublisher.disconnect();
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully');
+    httpServer.close(() => {
+        redisSubscriber.disconnect();
+        redisPublisher.disconnect();
+        process.exit(0);
+    });
+});
 
 startServer();
